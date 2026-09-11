@@ -1,10 +1,44 @@
 from datetime import datetime, timedelta, timezone
+import gzip
 import polars as pl
 
 # Point Weights Configuration
-WEIGHT_ATTEND = 15  # Actual QR scan check-in
+WEIGHT_ATTEND = 50  # Actual QR scan check-in
 WEIGHT_POST = 5
 WEIGHT_LIKE = 1
+
+
+# --- INGESTION & PARSING HELPERS ---
+
+
+def parse_raw_gcs_log(gz_bytes: bytes) -> pl.DataFrame:
+    """Decompresses .gz bytes from GCS and flattens JSON payload to match metric schemas."""
+    try:
+        try:
+            decompressed = gzip.decompress(gz_bytes)
+        except (gzip.BadGzipFile, OSError):
+            decompressed = gz_bytes
+
+        if not decompressed or not decompressed.strip():
+            return pl.DataFrame()
+
+        df = pl.read_ndjson(decompressed)
+        if df.is_empty() or "payload" not in df.columns:
+            return pl.DataFrame()
+
+        cleaned_df = df.select([
+            pl.col("timestamp").alias("server_timestamp"),
+            pl.col("payload").struct.field("u").alias("user_id"),
+            pl.col("payload").struct.field("e").alias("event_type"),
+            pl.col("payload").struct.field("id").alias("target_id"),
+            pl.col("payload").struct.field("yr").alias("college_year"),
+        ])
+
+        return cleaned_df
+    except Exception as e:
+        print(f"Failed to parse GCS log payload: {e}")
+        return pl.DataFrame()
+
 
 # --- TIME WINDOW HELPERS ---
 
@@ -17,9 +51,8 @@ def filter_by_days(cleaned_df: pl.DataFrame, days: int) -> pl.DataFrame:
     now_seconds = int(datetime.now(timezone.utc).timestamp())
     cutoff_seconds = now_seconds - (days * 86400)
 
-    # Detect if timestamp is in milliseconds vs seconds
     max_ts = cleaned_df["server_timestamp"].max()
-    if max_ts and max_ts > 1e11:  # Timestamp is in milliseconds
+    if max_ts and max_ts > 1e11:
         cutoff_epoch = cutoff_seconds * 1000
     else:
         cutoff_epoch = cutoff_seconds
@@ -86,7 +119,8 @@ def compute_student_weighted_scores(cleaned_df: pl.DataFrame) -> pl.DataFrame:
                 pl.col("attend_pts") + pl.col("post_pts") + pl.col("like_pts")
             ).alias("total_score")
         )
-        .sort("total_score", descending=True)
+        # Sort by total_score descending, with user_id ascending as explicit tie-breaker
+        .sort(by=["total_score", "user_id"], descending=[True, False])
     )
 
 
@@ -145,7 +179,11 @@ def compute_event_performance(cleaned_df: pl.DataFrame) -> pl.DataFrame:
             .alias("turnout_vs_rsvp_pct"),
         )
         .with_columns(pl.col("turnout_vs_rsvp_pct").alias("conversion_rate_pct"))
-        .sort("actual_attended", descending=True)
+        # Sort by actual_attended desc, views desc, target_id asc tie-breaker
+        .sort(
+            by=["actual_attended", "views", "target_id"],
+            descending=[True, True, False],
+        )
     )
 
 
@@ -184,7 +222,11 @@ def compute_post_performance(cleaned_df: pl.DataFrame) -> pl.DataFrame:
             .otherwise(0.0)
             .alias("engagement_rate_pct")
         )
-        .sort("views", descending=True)
+        # Sort by views desc, likes desc, target_id asc tie-breaker
+        .sort(
+            by=["views", "likes", "target_id"],
+            descending=[True, True, False],
+        )
     )
 
 
@@ -194,7 +236,6 @@ def compute_post_performance(cleaned_df: pl.DataFrame) -> pl.DataFrame:
 def _get_valid_dfs(
     dfs: list[pl.DataFrame], required_cols: set[str] = None
 ) -> list[pl.DataFrame]:
-    """Helper to strip out empty dataframes or missing schemas to prevent pl.concat crashes."""
     valid = []
     for df in dfs:
         if df.is_empty():
@@ -233,7 +274,11 @@ def compute_monthly_post_performance(
             .otherwise(0.0)
             .alias("engagement_rate_pct")
         )
-        .sort(["engagement_rate_pct", "views"], descending=[True, True])
+        # Deterministic sorting sequence for monthly posts
+        .sort(
+            by=["engagement_rate_pct", "views", "likes", "target_id"],
+            descending=[True, True, True, False],
+        )
     )
 
 
@@ -278,7 +323,8 @@ def compute_monthly_student_scores(
                 pl.col("attend_pts") + pl.col("post_pts") + pl.col("like_pts")
             ).alias("total_score")
         )
-        .sort("total_score", descending=True)
+        # Deterministic sorting sequence for monthly students
+        .sort(by=["total_score", "user_id"], descending=[True, False])
     )
 
 
@@ -321,5 +367,9 @@ def compute_monthly_event_performance(
             .alias("turnout_vs_rsvp_pct"),
         )
         .with_columns(pl.col("turnout_vs_rsvp_pct").alias("conversion_rate_pct"))
-        .sort("actual_attended", descending=True)
+        # Deterministic sorting sequence for monthly events
+        .sort(
+            by=["actual_attended", "views", "target_id"],
+            descending=[True, True, False],
+        )
     )

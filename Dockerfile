@@ -18,5 +18,5 @@ RUN mkdir -p /app/data/summaries
 
 EXPOSE 5000
 
-# Launch FastAPI server with integrated APScheduler
-CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "5000"]
+# Explicitly enforce 1 worker to prevent duplicate APScheduler instances
+CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "5000", "--workers", "1"]

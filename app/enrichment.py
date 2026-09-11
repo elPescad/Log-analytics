@@ -1,74 +1,80 @@
-import json
 import os
-import urllib.request
-import urllib.parse
-from typing import Dict, Any, List
+import requests
+import logging
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+logger = logging.getLogger(__name__)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-def _fetch_supabase_table(table_name: str, ids: List[str], select_cols: str) -> List[Dict[str, Any]]:
-    if not ids or not SUPABASE_URL or not SUPABASE_KEY:
-        return []
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json"
+}
 
-    ids_param = f"in.({','.join(ids)})"
-    params = urllib.parse.urlencode({"id": ids_param, "select": select_cols})
-    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table_name}?{params}"
+def fetch_supabase_table(table_name: str, id_list: list, select_cols: str = "*") -> dict:
+    """Fetch rows from PostgREST with guards against empty filter strings."""
+    if not id_list:
+        return {}
 
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-    }
+    unique_ids = list(set(str(i) for i in id_list if i))
+    if not unique_ids:
+        return {}
 
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    formatted_ids = ",".join(f'"{i}"' for i in unique_ids)
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}?id=in.({formatted_ids})&select={select_cols}"
+    
     try:
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode("utf-8"))
+        response = requests.get(url, headers=HEADERS, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        return {str(item["id"]): item for item in data if "id" in item}
     except Exception as e:
-        print(f"Warning: Failed to fetch {table_name} metadata from Supabase: {e}")
-        return []
+        logger.warning(f"Failed to fetch {table_name} metadata from Supabase: {e}")
+        return {}
 
-def enrich_cache_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolves UUIDs in payload to names, titles, and descriptions using Supabase."""
+
+def enrich_cache_payload(payload: dict) -> dict:
+    """Hydrate leaderboard user IDs, event IDs, and post IDs with Supabase metadata."""
+    if not payload:
+        return payload
+
+    # 1. Gather all IDs needing metadata lookup
+    leaderboard = payload.get("weekly_leaderboard", [])
+    user_ids = [entry["user_id"] for entry in leaderboard if "user_id" in entry]
     
-    # 1. Collect all unique IDs
-    student_ids = list({s["user_id"] for s in payload.get("student_leaderboard", []) if "user_id" in s})
-    
-    events_list = payload.get("weekly", {}).get("events", []) + payload.get("monthly", {}).get("events", [])
-    event_ids = list({e["event_id"] for e in events_list if "event_id" in e})
-    
-    posts_list = payload.get("weekly", {}).get("posts", []) + payload.get("monthly", {}).get("posts", [])
-    post_ids = list({p["post_id"] for p in posts_list if "post_id" in p})
+    event_ids = []
+    post_ids = []
+    for entry in leaderboard:
+        event_ids.extend(entry.get("attended_event_ids", []))
+        post_ids.extend(entry.get("post_ids", []))
 
-    # 2. Query Supabase Tables
-    users_data = _fetch_supabase_table("users", student_ids, "id,first_name,last_name")
-    events_data = _fetch_supabase_table("events", event_ids, "id,name")
-    posts_data = _fetch_supabase_table("posts", post_ids, "id,content")
+    # 2. Query Supabase endpoints safely (tries 'users', falls back to 'profiles' if empty)
+    users_meta = fetch_supabase_table("users", user_ids, select_cols="id,full_name,display_name")
+    if not users_meta:
+        users_meta = fetch_supabase_table("profiles", user_ids, select_cols="id,full_name,display_name")
+        
+    events_meta = fetch_supabase_table("events", event_ids, select_cols="id,title")
+    posts_meta = fetch_supabase_table("posts", post_ids, select_cols="id,content,title")
 
-    # Build Mapping Lookups
-    user_map = {
-        u["id"]: f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() + f" ({u['id'][:8]})"
-        for u in users_data
-    }
-    event_map = {e["id"]: e.get("name", "Unknown Event") for e in events_data}
-    post_map = {p["id"]: (p.get("content", "")[:40] + "..." if len(p.get("content", "")) > 40 else p.get("content", "Post")) for p in posts_data}
+    # 3. Attach enriched names/titles to leaderboard entries
+    for entry in leaderboard:
+        uid = str(entry.get("user_id"))
+        user_info = users_meta.get(uid, {})
+        entry["user_name"] = user_info.get("full_name") or user_info.get("display_name") or "Unknown Student"
 
-    # 3. Hydrate Student Leaderboard
-    for student in payload.get("student_leaderboard", []):
-        uid = student.get("user_id", "")
-        student["display_name"] = user_map.get(uid, f"User ({uid[:8]})")
+        # Enrich event names
+        entry["attended_events"] = [
+            events_meta.get(str(eid), {}).get("title", f"Event {eid[:6]}")
+            for eid in entry.get("attended_event_ids", [])
+        ]
 
-    # 4. Hydrate Weekly & Monthly Events
-    for section in ["weekly", "monthly"]:
-        for evt in payload.get(section, {}).get("events", []):
-            eid = evt.get("event_id", "")
-            evt["name"] = event_map.get(eid, f"Event ({eid[:8]})")
+        # Enrich post snippets
+        entry["posts"] = [
+            posts_meta.get(str(pid), {}).get("title") or posts_meta.get(str(pid), {}).get("content", "Post Content")[:30]
+            for pid in entry.get("post_ids", [])
+        ]
 
-    # 5. Hydrate Weekly & Monthly Posts
-    for section in ["weekly", "monthly"]:
-        for pst in payload.get(section, {}).get("posts", []):
-            pid = pst.get("post_id", "")
-            pst["content_snippet"] = post_map.get(pid, f"Post ({pid[:8]})")
-
+    payload["weekly_leaderboard"] = leaderboard
     return payload

@@ -60,13 +60,18 @@ class LogParser:
         )
 
         try:
-            # High-performance native Rust JSON decoding
+            payload_dtype = df.schema["payload"]
+
+            # Safely handle both JSON string payloads and native Polars Structs
+            if payload_dtype in (pl.String, pl.Utf8):
+                payload_expr = pl.col("payload").str.json_decode(dtype=payload_schema)
+            elif isinstance(payload_dtype, pl.Struct):
+                payload_expr = pl.col("payload").cast(payload_schema)
+            else:
+                payload_expr = pl.col("payload").cast(pl.String).str.json_decode(dtype=payload_schema)
+
             result = (
-                df.with_columns(
-                    # If payload is accidentally parsed as a Struct instead of String by read_ndjson,
-                    # casting it to string first ensures json_decode never crashes.
-                    pl.col("payload").cast(pl.String).str.json_decode(dtype=payload_schema)
-                )
+                df.with_columns(payload_expr.alias("payload"))
                 .unnest("payload")
                 .rename(
                     {
