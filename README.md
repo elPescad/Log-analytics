@@ -1,4 +1,4 @@
-# Campus Telemetry Analytics Engine & REST API
+# Log Uploader Engine & REST API
 
 **[Source](https://github.com/elPescad/telemetry-analytics/tree/master/app)**
 
