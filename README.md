@@ -1,4 +1,4 @@
-# Log Uploader Engine & REST API
+# Log Analytics Engine & REST API
 
 **[Source](https://github.com/elPescad/telemetry-analytics/tree/master/app)**
 
